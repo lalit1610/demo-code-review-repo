@@ -1,31 +1,128 @@
-name: Automated Code Review
+import os
+import boto3
+import json
+import requests
 
-on:
-  pull_request:
-    branches:
-      - main
+def initialize_bedrock_client():
+    """Initialize AWS Bedrock client with region from environment."""
+    region = os.getenv('BEDROCK_REGION')
+    if not region:
+        raise ValueError("Environment variable 'BEDROCK_REGION' is not set.")
+    return boto3.client('bedrock', region_name=region)
 
-jobs:
-  code_review:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v3
+def get_github_env_variables():
+    """Fetch GitHub-related environment variables."""
+    github_token = os.getenv('GITHUB_TOKEN')
+    repo = os.getenv('GITHUB_REPO')
+    pr_number = os.getenv('PR_NUMBER')
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.9'
+    missing = []
+    if not github_token:
+        missing.append('GITHUB_TOKEN')
+    if not repo:
+        missing.append('GITHUB_REPO')
+    if not pr_number:
+        missing.append('PR_NUMBER')
+    if missing:
+        raise ValueError(f"Missing environment variables: {', '.join(missing)}")
 
-      - name: Install dependencies
-        run: pip install boto3 requests
+    return github_token, repo, pr_number
 
-      - name: Run code review script
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BEDROCK_REGION: ap-south-1
-          GITHUB_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: python code_review.py
+def get_pr_changed_files(github_token, repo, pr_number):
+    """Retrieve list of changed files in the PR via GitHub API."""
+    headers = {'Authorization': f'token {github_token}'}
+    url = f'https://api.github.com/repos/{repo}/pulls/{pr_number}/files'
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    return response.json()
+
+def call_bedrock_model(bedrock_client, code_snippet):
+    """Invoke Bedrock foundation model to review the code snippet."""
+    prompt = f"""
+You are an expert software engineer reviewing this code snippet:
+
+{code_snippet}
+
+Please provide:
+1. Code quality issues
+2. Potential bugs or security vulnerabilities
+3. Recommendations to improve performance and readability.
+"""
+
+    response = bedrock_client.invoke_model(
+        ModelId='Claude Sonnet 4',  # Replace with your actual model ID
+        ContentType='application/json',
+        Accept='application/json',
+        Body=json.dumps({
+            'prompt': prompt,
+            'max_tokens_to_sample': 500
+        })
+    )
+
+    result_json = json.loads(response['Body'].read().decode())
+    return result_json.get('completion', '')
+
+def get_latest_commit_sha(github_token, repo, pr_number):
+    """Retrieve the latest commit SHA for the PR."""
+    headers = {'Authorization': f'token {github_token}'}
+    url = f'https://api.github.com/repos/{repo}/pulls/{pr_number}'
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    pr_data = response.json()
+    return pr_data['head']['sha']
+
+def post_comment(github_token, repo, pr_number, commit_sha, path, line, comment):
+    """Post a review comment to the GitHub PR."""
+    url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/comments"
+    headers = {
+        'Authorization': f'token {github_token}',
+        'Accept': 'application/vnd.github+json'
+    }
+    payload = {
+        "body": comment,
+        "commit_id": commit_sha,
+        "path": path,
+        "line": line,
+        "side": "RIGHT"
+    }
+    response = requests.post(url, headers=headers, json=payload)
+    response.raise_for_status()
+
+def main():
+    # Initialize clients and get environment details
+    bedrock_client = initialize_bedrock_client()
+    github_token, repo, pr_number = get_github_env_variables()
+
+    # Get changed files in the PR
+    changed_files = get_pr_changed_files(github_token, repo, pr_number)
+    if not changed_files:
+        print("No changed files detected in the pull request.")
+        return
+
+    # Get commit SHA for posting comments
+    commit_sha = get_latest_commit_sha(github_token, repo, pr_number)
+
+    for file_info in changed_files:
+        path = file_info['filename']
+        patch = file_info.get('patch')
+        if not patch:
+            print(f"Skipping file {path}: no diff available.")
+            continue
+
+        print(f"Generating review for {path}...")
+
+        try:
+            review_feedback = call_bedrock_model(bedrock_client, patch)
+        except Exception as e:
+            print(f"Error calling Bedrock model for {path}: {str(e)}")
+            continue
+
+        try:
+            # Post comment on first line of the file diff for demonstration
+            post_comment(github_token, repo, pr_number, commit_sha, path, 1, review_feedback)
+            print(f"Posted review comment on {path}")
+        except Exception as e:
+            print(f"Error posting comment for {path}: {str(e)}")
+
+if __name__ == "__main__":
+    main()
