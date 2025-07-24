@@ -2,7 +2,6 @@ import os
 import boto3
 import json
 import requests
-
 # Initialize Bedrock client with your AWS region
 bedrock = boto3.client('bedrock', region_name=os.getenv('BEDROCK_REGION'))
 
