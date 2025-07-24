@@ -3,3 +3,4 @@ def fetch_data():
     for i in range(10000):
         data.append(i)
     return data
+    
